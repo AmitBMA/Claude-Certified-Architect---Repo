@@ -16,6 +16,14 @@ import json
 import logging
 import os
 
+import truststore
+
+# Use the OS certificate store (not just the certifi bundle) for outbound
+# HTTPS calls -- required behind corporate TLS-inspecting proxies where the
+# proxy's root CA is trusted by Windows but not by certifi.
+truststore.inject_into_ssl()
+
+import httpx
 from anthropic import AnthropicBedrock
 
 logging.basicConfig(
@@ -51,22 +59,54 @@ WEATHER_TOOL = {
     },
 }
 
-# Mock weather data so this demo runs with no external API dependency.
-FAKE_WEATHER = {
-    "san francisco": {"temp_f": 61, "condition": "foggy"},
-    "tokyo": {"temp_f": 72, "condition": "clear"},
+# WMO weather-code -> human-readable condition (subset covering common codes).
+# https://open-meteo.com/en/docs#weathervariables
+_WMO_CONDITIONS = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "freezing fog",
+    51: "light drizzle", 53: "moderate drizzle", 55: "dense drizzle",
+    61: "light rain", 63: "moderate rain", 65: "heavy rain",
+    71: "light snow", 73: "moderate snow", 75: "heavy snow",
+    80: "light rain showers", 81: "moderate rain showers", 82: "violent rain showers",
+    95: "thunderstorm", 96: "thunderstorm with hail", 99: "thunderstorm with heavy hail",
 }
 
 
 def get_weather(location: str, unit: str = "fahrenheit") -> dict:
-    """Tool implementation. In a real app this would call a weather API."""
-    key = location.lower()
-    data = next(
-        (v for k, v in FAKE_WEATHER.items() if k in key),
-        {"temp_f": 70, "condition": "unknown"},
-    )
-    temp = data["temp_f"] if unit == "fahrenheit" else round((data["temp_f"] - 32) * 5 / 9)
-    return {"location": location, "unit": unit, "temperature": temp, "condition": data["condition"]}
+    """Tool implementation. Calls Open-Meteo (free, no API key) for real data."""
+    with httpx.Client(timeout=10.0) as http:
+        geo = http.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": location, "count": 1},
+        ).json()
+        results = geo.get("results")
+        if not results:
+            return {"location": location, "error": "location not found"}
+
+        place = results[0]
+        lat, lon = place["latitude"], place["longitude"]
+        resolved_name = ", ".join(
+            part for part in (place.get("name"), place.get("admin1"), place.get("country")) if part
+        )
+
+        forecast = http.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current": "temperature_2m,weather_code",
+                "temperature_unit": "fahrenheit" if unit == "fahrenheit" else "celsius",
+            },
+        ).json()
+
+    current = forecast["current"]
+    condition = _WMO_CONDITIONS.get(current["weather_code"], f"code {current['weather_code']}")
+    return {
+        "location": resolved_name,
+        "unit": unit,
+        "temperature": current["temperature_2m"],
+        "condition": condition,
+    }
 
 
 def log_response(turn: int, response) -> None:
@@ -92,7 +132,7 @@ def log_response(turn: int, response) -> None:
             )
 
 
-def run_agentic_loop(client: Anthropic, user_message: str) -> str:
+def run_agentic_loop(client: AnthropicBedrock, user_message: str) -> str:
     messages = [{"role": "user", "content": user_message}]
     log.info("user: %s", user_message)
 
@@ -160,7 +200,7 @@ def run_agentic_loop(client: Anthropic, user_message: str) -> str:
 
 def main() -> None:
     client = AnthropicBedrock()
-    run_agentic_loop(client, "What's the weather like in San Francisco right now?")
+    run_agentic_loop(client, "What's the weather like in Bengaluru right now?")
 
 
 if __name__ == "__main__":
